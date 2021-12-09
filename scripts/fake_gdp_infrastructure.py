@@ -2,15 +2,14 @@ import zmq
 import time
 import sys
 
-port = "5556"
-context = zmq.Context()
-socket = context.socket(zmq.REP)
-socket.bind("tcp://*:%s" % port)
 
 
-while True:
-    #  Wait for next request from client
-    message = socket.recv()
-    print ("Received request: ", message)
-    time.sleep (1)  
-    socket.send(b"World from %s" % port)
+context = zmq.Context(1)
+# Socket facing clients
+frontend = context.socket(zmq.SUB)
+frontend.bind("tcp://*:5559")
+frontend.setsockopt(zmq.SUBSCRIBE, b"")        
+# Socket facing services
+backend = context.socket(zmq.PUB)
+backend.bind("tcp://*:5560")
+zmq.device(zmq.FORWARDER, frontend, backend)

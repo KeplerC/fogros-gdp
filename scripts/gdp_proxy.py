@@ -5,35 +5,21 @@ from std_msgs.msg import String
 from conversions import *
 from pydispatch import dispatcher
 import zmq
-port = "5556"
+from threading import Thread
 
 
-
-
-class GDP_Infrastructure():
-    def __init__(self):
-        context = zmq.Context()
-        print ("Connecting to server...")
-        socket = context.socket(zmq.REQ)
-        socket.connect ("tcp://localhost:%s" % port)
-
-        for request in range (1,10):
-            print ("Sending request ", request,"...")
-            socket.send (b"Hello")
-            #  Get the reply.
-            message = socket.recv()
-            print ("Received reply ", request, "[", message, "]")
-    def send(self, message):
-        print(message)
-    def receive(self, message):
-        data = json.loads(message.data)
-        dispatcher.send(signal=data.get('topic'), message=data.get('msg'))
-
-class GDP_Client(GDP_Infrastructure):
-    def __init__(self):
+class GDP_Client():
+    def __init__(self, gdp_proxy):
         self._publishers = {}
         self._subscribers = {}
-        super().__init__()
+        self.gdp_proxy = gdp_proxy
+        
+        self.context = zmq.Context()
+        print ("Connecting to server...")
+        self.socket = self.context.socket(zmq.PUB)
+        #  Get the reply.
+        thread = Thread(target = self.receive, args = ())
+        thread.start()
         
     def publisher(self, topic_name, message_type):
         if topic_name in self._publishers:
@@ -43,6 +29,8 @@ class GDP_Client(GDP_Infrastructure):
             print('Advertising topic {} for publishing'.format(topic_name))
             publisher = _Publisher(self, topic_name, message_type)
             self._publishers[topic_name] = publisher
+
+        #TODO: it should advertise the topic on global data plane
         return publisher
     
     def unregister_publisher(self, topic_name):
@@ -68,6 +56,7 @@ class GDP_Client(GDP_Infrastructure):
             }))
             self._subscribers[topic_name] = {}
             self._subscribers[topic_name]['subscribers'] = [subscriber]
+        #TODO: it should advertise the topic on global data plane
         return subscriber
 
     def unsubscribe(self, subscriber):
@@ -93,6 +82,41 @@ class GDP_Client(GDP_Infrastructure):
             }))
             del self._subscribers[topic_name]
 
+    def send(self, message):
+        port = "5559"
+        self.socket.connect ("tcp://localhost:%s" % port)
+        print ("Send: " + message)
+        self.socket.send (("%s %s" % ("", message)).encode('utf-8'))
+
+        
+    def receive(self):
+        port = "5560"
+        # Socket to talk to server
+        context = zmq.Context()
+        socket = context.socket(zmq.SUB)
+        socket.connect ("tcp://localhost:%s" % port)
+        topicfilter = b""
+        socket.setsockopt(zmq.SUBSCRIBE, topicfilter)
+        while True:
+            message = socket.recv().decode()
+            print("Received message: ", message)
+            data = json.loads(message)
+            if (data.get("op") == "subscribe"):
+                print("Attempt to subscribe to a local topic")
+                self.gdp_proxy.create_new_local_topic(data.get("topic"), data.get("type"))
+            if data.get("op") == "unsubscribe":
+                print("dynamically adding new topic not allowed")
+                pass
+            if data.get("op") == "advertise":
+                print("dynamically adding new topic not allowed")
+                pass
+            if data.get("op") == "unadvertise":
+                print("dynamically adding new topic not allowed")
+                pass
+            if data.get("op") == "publish":
+                dispatcher.send(signal=data.get('topic'), message=data.get('msg'))
+            if data.get("op") == "unadvertise":
+                pass            
 
 
 class _Publisher(object):
@@ -177,15 +201,15 @@ class _Subscriber(object):
 class GDP_Proxy():
     def __init__(self):
         # topics
-        self.local_topics = [["chatter", 'std_msgs/String']]
         self.remote_topics = [["chatter", 'std_msgs/String']]
+        self.local_topics = [] #[["chatter", 'std_msgs/String']]
         self.rate_hz = 1
         self.check_if_msgs_are_installed()
         self.initialize()
 
     def initialize(self):
         # connect to GDP infrastructure
-        self.client = GDP_Client()
+        self.client = GDP_Client(self)
         
         # connect the topics 
         self._instances = {'topics': [], 'services': []}
@@ -202,11 +226,13 @@ class GDP_Proxy():
                 remote_name = topic_name
             elif len(lt) == 3:
                 topic_name, topic_type, remote_name = lt
-            self.create_new_local_topic(topic_name, topic_type, local_name)
+            self.create_new_local_topic(topic_name, topic_type, remote_name)
 
+    # Topics being published remotely to expose locally
     def create_new_remote_topic(self, topic_name, topic_type, local_name=""):
         if local_name == "":
             local_name = topic_name
+        print("create new remote topic to expose locally: ", topic_name, " ", topic_type)
         rospub = rospy.Publisher(local_name,
                                      get_ROS_class(topic_type),
                                      queue_size=1)
@@ -223,11 +249,12 @@ class GDP_Proxy():
                  {'rospub': rospub,
                   'bridgesub': None}
                  })
-
+        
+    # Topics being published locally to expose remotely
     def create_new_local_topic(self, topic_name, topic_type, remote_name=""):
         if remote_name == "":
             remote_name = topic_name
-        
+        print("create new local topic to expose remote: ", topic_name, " ", topic_type)
         bridgepub = self.client.publisher(remote_name, topic_type)
         
         cb_l_to_r = self.create_callback_from_local_to_remote(topic_name,
